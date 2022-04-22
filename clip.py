@@ -314,6 +314,69 @@ def model_forward_with_context(fn, args, freeze):
 
     return enc
 
+# contrastive loss function, adapted from
+# https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
+def contrastive_loss(logits) :
+    return tf.math.reduce_mean(
+        tf.keras.metrics.sparse_categorical_crossentropy(
+            y_true=tf.range(logits.shape[0]), y_pred=logits, from_logits=True
+        )
+    )
+
+def clip_loss(text_embeds, image_embeds, logit_scale) :
+    # normalized features
+    image_embeds = image_embeds / tf.norm(tensor=image_embeds, ord="euclidean", axis=-1, keepdims=True)
+    text_embeds = text_embeds / tf.norm(tensor=text_embeds, ord="euclidean", axis=-1, keepdims=True)
+
+    # cosine similarity as logits
+    logit_scale = tf.math.exp(logit_scale)
+    logits_per_text = tf.matmul(text_embeds, image_embeds, transpose_b=True) * logit_scale
+    logits_per_image = tf.transpose(logits_per_text)
+    similarity = logits_per_text
+
+    caption_loss = contrastive_loss(similarity)
+    image_loss = contrastive_loss(tf.transpose(similarity))
+    return (caption_loss + image_loss) / 2.0
+
+# https://github.com/lucidrains/x-clip
+def lucidrains_loss(text_latents, image_latents, temperature):
+    # equal to clip_loss
+    num_batch_texts = num_batch_images = 1
+    text_latents, image_latents = map(l2norm, (text_latents, image_latents))
+
+    # get temperature
+    temp = tf.exp(temperature)
+
+    # split out multiview dimension for text and images
+    text_latents = rearrange(text_latents, '(m b) ... -> m b ...', m=num_batch_texts)
+    image_latents = rearrange(image_latents, '(m b) ... -> m b ...', m=num_batch_images)
+
+    # calculate loss
+    text_to_image = einsum('m t d, n i d -> m n t i', text_latents, image_latents) * temp
+    image_to_text = rearrange(text_to_image, '... t i -> ... i t')
+
+    text_to_image = rearrange(text_to_image, 'm n ... -> (m n) ...')
+    image_to_text = rearrange(image_to_text, 'm n ... -> (m n) ...')
+
+    # exponentiate
+    text_to_image_exp, image_to_text_exp = map(tf.exp, (text_to_image, image_to_text))
+
+    # numerators
+    text_to_image_pos, image_to_text_pos = map(matrix_diag, (text_to_image_exp, image_to_text_exp))
+
+    # denominator
+    text_to_image_denom, image_to_text_denom = map(lambda t: tf.reduce_sum(t, axis=-1),
+                                                   (text_to_image_exp, image_to_text_exp))
+
+    # loss
+    text_to_image_loss = tf.reduce_mean(-log(text_to_image_pos / text_to_image_denom), axis=-1)
+    image_to_text_loss = tf.reduce_mean(-log(image_to_text_pos / image_to_text_denom), axis=-1)
+
+    # calculate CL loss
+    cl_loss = (text_to_image_loss + image_to_text_loss) / 2
+
+    return cl_loss
+
 # main clip class
 class CLIP(Model):
     def __init__(self,
@@ -396,9 +459,6 @@ class CLIP(Model):
         # derive text mask
         text_mask = text != self.text_pad_id
 
-        "need check"
-        # concat augmented texts and images and do some asserts
-        num_batch_texts = num_batch_images = 1
 
         assert not (return_loss and not training), 'loss cannot be used if not training'
 
@@ -427,42 +487,15 @@ class CLIP(Model):
         # project to latents
         text_latents = self.to_text_latent(text_embeds)
         image_latents = self.to_visual_latent(image_embeds)
-        text_latents, image_latents = map(l2norm, (text_latents, image_latents))
-
-        # get temperature
-        temp = tf.exp(self.temperature)
-
-        # split out multiview dimension for text and images
-        text_latents = rearrange(text_latents, '(m b) ... -> m b ...', m=num_batch_texts)
-        image_latents = rearrange(image_latents, '(m b) ... -> m b ...', m=num_batch_images)
 
         # calculate loss
-        text_to_image = einsum('m t d, n i d -> m n t i', text_latents, image_latents) * temp
-        image_to_text = rearrange(text_to_image, '... t i -> ... i t')
-
-        text_to_image = rearrange(text_to_image, 'm n ... -> (m n) ...')
-        image_to_text = rearrange(image_to_text, 'm n ... -> (m n) ...')
-
-        # exponentiate
-        text_to_image_exp, image_to_text_exp = map(tf.exp, (text_to_image, image_to_text))
-
-        # numerators
-        text_to_image_pos, image_to_text_pos = map(matrix_diag, (text_to_image_exp, image_to_text_exp))
-
-        # denominator
-        text_to_image_denom, image_to_text_denom = map(lambda t: tf.reduce_sum(t, axis=-1), (text_to_image_exp, image_to_text_exp))
-
-        # loss
-        text_to_image_loss = tf.reduce_mean(-log(text_to_image_pos / text_to_image_denom), axis=-1)
-        image_to_text_loss = tf.reduce_mean(-log(image_to_text_pos / image_to_text_denom), axis=-1)
-
-        # calculate CL loss
-        cl_losses = (text_to_image_loss + image_to_text_loss) / 2
+        # cl_loss = lucidrains_loss(text_latents, image_latents, self.temperature)
+        cl_loss = clip_loss(text_latents, image_latents, self.temperature)
 
         # calculate weights
         cl_loss_weight = 1
 
-        loss = cl_losses * cl_loss_weight
+        loss = cl_loss * cl_loss_weight
 
         return loss
 
