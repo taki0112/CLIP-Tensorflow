@@ -37,5 +37,8 @@ loss = clip_model(
 )
 ```
 
+## Reference
+* [x-clip](https://github.com/lucidrains/x-clip)
+
 ## Author
 * [Junho Kim](http://bit.ly/jhkim_resume)
