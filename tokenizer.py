@@ -1,14 +1,14 @@
 # take from https://github.com/openai/CLIP/blob/main/clip/simple_tokenizer.py
 # to give users a quick easy start to training DALL-E without doing BPE
 
-import torch
-
 import html
 import os
 from functools import lru_cache
 from pathlib import Path
 import ftfy
 import regex as re
+import tensorflow as tf
+import numpy as np
 
 # OpenAI simple tokenizer
 
@@ -120,8 +120,8 @@ class SimpleTokenizer():
         return bpe_tokens
 
     def decode(self, tokens, remove_start_end = True, pad_tokens = {}):
-        if torch.is_tensor(tokens):
-            tokens = tokens.tolist()
+        if tf.is_tensor(tokens):
+            tokens = tokens.numpy().tolist()
 
         if remove_start_end:
             tokens = [token for token in tokens if token not in (49406, 40407, 0)]
@@ -130,11 +130,19 @@ class SimpleTokenizer():
         return text
 
     def tokenize(self, texts, context_length = 256, truncate_text = False):
+        if tf.is_tensor(texts):
+            texts = texts.numpy().tolist()
+            t_list = []
+            for t in texts:
+                t_list.append(t.decode('utf-8'))
+
+            texts = t_list
+
         if isinstance(texts, str):
             texts = [texts]
 
         all_tokens = [self.encode(text) for text in texts]
-        result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
+        result = np.zeros([len(all_tokens), context_length], dtype=np.long)
 
         for i, tokens in enumerate(all_tokens):
             if len(tokens) > context_length:
@@ -142,11 +150,5 @@ class SimpleTokenizer():
                     tokens = tokens[:context_length]
                 else:
                     raise RuntimeError(f"Input {texts[i]} is too long for context length {context_length}")
-            result[i, :len(tokens)] = torch.tensor(tokens)
-
+            result[i, :len(tokens)] = tf.convert_to_tensor(tokens, dtype=tf.int32)
         return result
-
-tokenizer = SimpleTokenizer()
-
-x = tokenizer.tokenize(['apple', 'samsung'])
-print(x.shape)
